@@ -12,21 +12,18 @@ def derive_key(master_password, salt):
         salt=salt,
         iterations=100_000,
     )
-    key = kdf.derive(master_password.encode())
-    return key
+    return kdf.derive(master_password.encode())
 
 
 def encrypt(plaintext, key):
     nonce = os.urandom(12)
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
-    return base64.b64encode(nonce + ciphertext).decode()
+    ct = aesgcm.encrypt(nonce, plaintext.encode(), None)
+    return base64.b64encode(nonce + ct).decode()
 
 
 def decrypt(encrypted_data, key):
     raw = base64.b64decode(encrypted_data)
-    nonce = raw[:12]
-    ciphertext = raw[12:]
+    nonce, ct = raw[:12], raw[12:]
     aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    return plaintext.decode()
+    return aesgcm.decrypt(nonce, ct, None).decode()

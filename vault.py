@@ -4,16 +4,18 @@ import base64
 import shutil
 from encryption import derive_key, encrypt, decrypt
 
-VAULT_DIR = os.path.join(os.path.expanduser("~"), ".pypassvault")
-MASTER_FILE = os.path.join(VAULT_DIR, "master.json")
-ATTEMPTS_FILE = os.path.join(VAULT_DIR, "attempts.json")
+VAULT_DIR = os.path.join(os.path.expanduser('~'), '.pypassvault')
+MASTER_FILE = os.path.join(VAULT_DIR, 'master.json')
+ATTEMPTS_FILE = os.path.join(VAULT_DIR, 'attempts.json')
 
-MAX_FAILED_ATTEMPTS = 20
+MAX_ATTEMPTS = 20
+
+# categories that would collide with internal filenames
+_RESERVED = {'master', 'attempts'}
 
 
-def setup_vault_dir():
-    if not os.path.exists(VAULT_DIR):
-        os.makedirs(VAULT_DIR)
+def _ensure_dir():
+    os.makedirs(VAULT_DIR, exist_ok=True)
 
 
 def is_vault_created():
@@ -21,164 +23,169 @@ def is_vault_created():
 
 
 def create_vault(master_password):
-    setup_vault_dir()
+    _ensure_dir()
+    _clear_attempts()
     salt = os.urandom(16)
     key = derive_key(master_password, salt)
 
-    test_data = encrypt("VAULT_OK", key)
-    master_info = {
-        "salt": base64.b64encode(salt).decode(),
-        "verify": test_data,
-    }
-
-    with open(MASTER_FILE, "w") as f:
-        json.dump(master_info, f)
+    token = encrypt('VAULT_OK', key)
+    with open(MASTER_FILE, 'w') as f:
+        json.dump({
+            'salt': base64.b64encode(salt).decode(),
+            'verify': token,
+        }, f)
 
     return key, salt
 
 
 def unlock_vault(master_password):
-    # check if already locked out before even trying
-    failed = get_failed_attempts()
-    if failed >= MAX_FAILED_ATTEMPTS:
-        print("\n⚠️  BRUTE-FORCE DETECTED! Too many failed attempts.")
-        print("💀 SELF-DESTRUCT ACTIVATED — All vault data destroyed.")
-        nuke_vault()
+    attempts = _get_attempts()
+    if attempts >= MAX_ATTEMPTS:
+        _self_destruct()
         return None, None
 
-    with open(MASTER_FILE, "r") as f:
-        master_info = json.load(f)
+    with open(MASTER_FILE) as f:
+        info = json.load(f)
 
-    salt = base64.b64decode(master_info["salt"])
+    salt = base64.b64decode(info['salt'])
     key = derive_key(master_password, salt)
 
     try:
-        result = decrypt(master_info["verify"], key)
-        if result == "VAULT_OK":
-            reset_failed_attempts()
+        if decrypt(info['verify'], key) == 'VAULT_OK':
+            _clear_attempts()
             return key, salt
     except Exception:
         pass
 
-    # wrong password — increment counter
-    failed = increment_failed_attempts()
-    remaining = MAX_FAILED_ATTEMPTS - failed
-    if remaining > 0:
-        print(f"⚠️  Wrong password! {remaining} attempt(s) remaining before SELF-DESTRUCT.")
+    attempts = _bump_attempts()
+    left = MAX_ATTEMPTS - attempts
+    if left > 0:
+        print(f'Wrong password. {left} tries left before self-destruct.')
     else:
-        print("\n⚠️  BRUTE-FORCE DETECTED! Maximum failed attempts reached.")
-        print("💀 SELF-DESTRUCT ACTIVATED — All vault data destroyed.")
-        nuke_vault()
+        _self_destruct()
 
     return None, None
 
 
-def get_failed_attempts():
-    """Read the current failed attempt count from disk."""
+# --- attempt tracking --------------------------------------------------------
+
+def _get_attempts():
     if not os.path.exists(ATTEMPTS_FILE):
         return 0
     try:
-        with open(ATTEMPTS_FILE, "r") as f:
-            data = json.load(f)
-        return data.get("failed_attempts", 0)
+        with open(ATTEMPTS_FILE) as f:
+            return json.load(f).get('n', 0)
     except (json.JSONDecodeError, IOError):
         return 0
 
 
-def increment_failed_attempts():
-    """Increment and persist the failed attempt counter. Returns new count."""
-    count = get_failed_attempts() + 1
-    setup_vault_dir()
-    with open(ATTEMPTS_FILE, "w") as f:
-        json.dump({"failed_attempts": count}, f)
-    return count
+def _bump_attempts():
+    n = _get_attempts() + 1
+    _ensure_dir()
+    with open(ATTEMPTS_FILE, 'w') as f:
+        json.dump({'n': n}, f)
+    return n
 
 
-def reset_failed_attempts():
-    """Reset the failed attempt counter (called on successful login)."""
+def _clear_attempts():
     if os.path.exists(ATTEMPTS_FILE):
         os.remove(ATTEMPTS_FILE)
 
 
-def nuke_vault():
-    """Destroy ALL vault data — every file in the vault directory. No recovery."""
+# public aliases so tests can import them
+get_failed_attempts = _get_attempts
+increment_failed_attempts = _bump_attempts
+reset_failed_attempts = _clear_attempts
+
+
+# --- destructive ops ---------------------------------------------------------
+
+def _self_destruct():
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
-    print("🔥 All vault data has been permanently destroyed.")
-    print("ℹ️  You can start fresh by running PyPassVault again.")
+    print('Self-destruct triggered. All vault data wiped.')
+    print('Run PyPassVault again to start over.')
+
+nuke_vault = _self_destruct
 
 
 def reset_vault():
-    """Manually reset the vault — wipes everything and starts clean."""
     if os.path.exists(VAULT_DIR):
         shutil.rmtree(VAULT_DIR)
-    print("🔄 Vault has been completely reset.")
-    print("ℹ️  All passwords and settings have been erased.")
-    print("ℹ️  Run PyPassVault again to create a new vault.")
+    print('Vault reset. Everything deleted.')
+    print('Run PyPassVault again to set up a new vault.')
 
 
-def get_vault_file(category):
-    return os.path.join(VAULT_DIR, f"{category}.json")
+# --- category / password CRUD ------------------------------------------------
+
+def _cat_file(category):
+    return os.path.join(VAULT_DIR, f'{category}.json')
 
 
-def load_passwords(category, key):
-    filepath = get_vault_file(category)
-    if not os.path.exists(filepath):
+def is_reserved_category(name):
+    norm = name.strip().lower()
+    return norm in _RESERVED or '/' in norm or '\\' in norm or not norm or norm.startswith('.')
+
+
+def _load(category, key):
+    path = _cat_file(category)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, IOError):
         return {}
 
-    with open(filepath, "r") as f:
-        encrypted_entries = json.load(f)
+    entries = {}
+    for name, data in raw.items():
+        try:
+            entries[name] = json.loads(decrypt(data, key))
+        except Exception:
+            print(f"Warning: Failed to decrypt entry '{name}' in category '{category}'.")
+    return entries
 
-    passwords = {}
-    for name, enc_data in encrypted_entries.items():
-        passwords[name] = json.loads(decrypt(enc_data, key))
 
-    return passwords
-
-
-def save_passwords(category, passwords, key):
-    setup_vault_dir()
-    encrypted_entries = {}
-    for name, data in passwords.items():
-        encrypted_entries[name] = encrypt(json.dumps(data), key)
-
-    filepath = get_vault_file(category)
-    with open(filepath, "w") as f:
-        json.dump(encrypted_entries, f, indent=2)
+def _save(category, entries, key):
+    _ensure_dir()
+    path = _cat_file(category)
+    if not entries:
+        # don't leave empty category files lying around
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    enc = {name: encrypt(json.dumps(data), key) for name, data in entries.items()}
+    with open(path, 'w') as f:
+        json.dump(enc, f, indent=2)
 
 
 def add_password(category, name, username, password, key):
-    passwords = load_passwords(category, key)
-    passwords[name] = {
-        "username": username,
-        "password": password,
-    }
-    save_passwords(category, passwords, key)
+    entries = _load(category, key)
+    entries[name] = {'username': username, 'password': password}
+    _save(category, entries, key)
 
 
 def get_password(category, name, key):
-    passwords = load_passwords(category, key)
-    return passwords.get(name, None)
+    return _load(category, key).get(name)
 
 
 def delete_password(category, name, key):
-    passwords = load_passwords(category, key)
-    if name in passwords:
-        del passwords[name]
-        save_passwords(category, passwords, key)
-        return True
-    return False
+    entries = _load(category, key)
+    if name not in entries:
+        return False
+    del entries[name]
+    _save(category, entries, key)
+    return True
 
 
 def list_categories():
-    setup_vault_dir()
-    categories = []
-    for f in os.listdir(VAULT_DIR):
-        if f.endswith(".json") and f != "master.json" and f != "attempts.json":
-            categories.append(f.replace(".json", ""))
-    return categories
+    _ensure_dir()
+    out = []
+    for fname in os.listdir(VAULT_DIR):
+        if fname.endswith('.json') and fname not in ('master.json', 'attempts.json'):
+            out.append(fname[:-5])
+    return out
 
 
 def list_entries(category, key):
-    passwords = load_passwords(category, key)
-    return list(passwords.keys())
+    return list(_load(category, key).keys())

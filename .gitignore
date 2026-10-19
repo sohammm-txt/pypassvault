@@ -7,3 +7,4 @@ venv/
 *.sqlite3
 .idea/
 .vscode/
+_test_vault_tmp/
